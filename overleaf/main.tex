@@ -3,11 +3,9 @@
 \usepackage[margin=1in]{geometry}
 \usepackage{graphicx}
 \usepackage{amsmath,amssymb}
-\usepackage{booktabs}
 \usepackage{siunitx}
 \usepackage{float}
 \usepackage{hyperref}
-\usepackage{enumitem}
 \usepackage{setspace}
 \usepackage{caption}
 
@@ -22,7 +20,7 @@
 \setlength{\parindent}{0em}
 \onehalfspacing
 
-\title{EE4308 Project 1 Report Draft\\Designing Nav2 Controller and Planner Plugins}
+\title{EE4308 Project 1 Report\\Designing Nav2 Controller and Planner Plugins}
 \author{Arnav Salkade\\Matric No.: \texttt{[YOUR MATRIC]}}
 \date{February 2026}
 
@@ -31,279 +29,161 @@
 \tableofcontents
 \newpage
 
+\begin{abstract}
+This report presents the design, implementation, and tuning of custom Nav2 planner and controller plugins for EE4308 Project 1. The planner is built around A* search with explicit safety checks, diagonal corner-cut prevention, waypoint densification, and Savitzky--Golay smoothing. The controller is implemented using regulated pure pursuit with curvature and proximity heuristics, together with explicit final-orientation alignment logic. The project was tuned through iterative, cause-driven debugging: each observed behavior was mapped to algorithmic causes before parameter changes were applied. The final system improved corridor tracking stability, reduced inflation-zone hugging, and produced more reliable near-goal behavior while preserving collision-aware navigation.
+\end{abstract}
+
 \section{Introduction}
-This report documents the design and tuning of custom Nav2 planner and controller plugins for EE4308 Project 1. The objective is to achieve reliable navigation through narrow corridors and tight turns while maintaining smooth and stable motion near obstacles and at the goal.
+The objective of Project 1 is not only to produce a robot that moves from start to goal, but to produce a motion stack that remains stable, safe, and explainable under realistic constraints such as narrow corridors, inflated costmaps, and imperfect startup conditions. In this work, the implementation strategy was to separate the global planning problem from the local tracking problem and then couple them through robust path post-processing. The planner was designed to produce feasible and controller-friendly trajectories, while the controller was designed to preserve path adherence without unstable oscillations near obstacles and near the terminal pose.
 
-The implemented pipeline consists of:
-\begin{itemize}[leftmargin=1.5em]
-    \item an A* global planner on occupancy-cost maps,
-    \item post-processing (densification and Savitzky--Golay smoothing),
-    \item a regulated pure pursuit controller with curvature and obstacle-based velocity regulation,
-    \item explicit goal orientation alignment logic.
-\end{itemize}
+A key guiding principle throughout the project was the distinction between \emph{effect} and \emph{cause}. For example, when the robot hugged inflation regions, the immediate effect was visible in RViz, but the relevant causes were primarily the accessibility threshold and the geometry of the candidate path segments after smoothing. Similarly, when the first run occasionally failed while the second run succeeded, the effect was intermittent path failure, whereas the causes were likely startup synchronization and transient state readiness of TF and costmap layers. This report is written around these causal links so that each implementation decision is technically justified rather than empirically guessed.
 
-The final implementation was driven by ``cause-to-effect'' analysis: each tuning change was linked to a specific observed failure mode (corner cutting, inflation hugging, near-goal oscillation, first-run instability).
+\section{Methodology and Evaluation Process}
+The development process was structured as iterative ablation. A baseline planner-controller pair was executed, a single failure mode was isolated, one change was introduced, and the run was repeated across the same map regions. This process was repeated for planner geometry, smoothing behavior, and controller regulation until performance stabilized. The approach deliberately avoided multi-parameter random tuning in early stages because simultaneous parameter changes made diagnosis ambiguous.
 
-\section{System Overview}
-\subsection{Planning and Control Architecture}
-The navigation stack uses a global planner to produce a geometric path, and a controller to convert this path into real-time velocity commands. In this project:
-\begin{itemize}[leftmargin=1.5em]
-    \item The planner generates a collision-aware path over the costmap.
-    \item The controller tracks the path using lookahead geometry in the robot frame.
-    \item Laser scan data regulates speed near obstacles.
-\end{itemize}
+Evaluation was primarily conducted in simulation with occupancy-cost maps containing straight corridors, bend transitions, and corner bottlenecks. The two primary qualitative metrics were path feasibility and tracking quality. Feasibility was defined as generation of a valid path that respected map bounds and avoided obstacle intrusion. Tracking quality was defined as low oscillation, smooth heading evolution, and reliable stop behavior at the terminal orientation. Additional observations, such as first-run instability and inflation hugging, were recorded and tied to their algorithmic causes.
 
-\subsection{Design Targets}
-The following criteria were used to assess quality:
-\begin{itemize}[leftmargin=1.5em]
-    \item path validity (no out-of-map points, no corner cutting through blocked cells),
-    \item tracking stability (minimal oscillation in corridors),
-    \item safety margin (avoid aggressive inflation-zone hugging),
-    \item proper terminal behavior (stop near goal, rotate to final heading).
-\end{itemize}
-
-\section{Planner Design and Improvements}
-\subsection{A* Formulation}
-The planner uses A* with the standard evaluation:
+\section{Planner: Implementation and Reasoning}
+\subsection{A* Search Structure and Data Design}
+The planner uses A* search with the canonical evaluation function
 \begin{equation}
     f(n) = g(n) + h(n),
 \end{equation}
-where $g(n)$ is accumulated traversal cost and $h(n)$ is a heuristic estimate to goal.
+where $g(n)$ is accumulated traversal cost and $h(n)$ estimates remaining cost to goal. Nodes are stored with parent pointers for backtracking, and an open list is implemented as a priority queue ordered by minimum $f$. A node can appear in the queue multiple times when a lower-cost route is found, while expansion is guarded by an \texttt{expanded} flag; this design preserves optimality under cost relaxation and prevents the algorithm from terminating early on stale queue entries.
 
-For an 8-connected grid, the final heuristic selection was octile distance:
+Coordinate conversion helpers were implemented as explicit functions to reduce indexing errors. World coordinates are mapped to costmap cell coordinates by flooring against map origin and resolution, cell coordinates are converted back to world coordinates using cell-center offsets, and row-major flattening is used for constant-time indexing into arrays. These helper functions were treated as critical infrastructure because small coordinate errors in this layer propagate into major planner failures that can be difficult to diagnose at runtime.
+
+\subsection{Heuristic Selection: Admissibility, Consistency, and Practical Dominance}
+The search was evaluated with Manhattan, Euclidean, and octile-style heuristic forms. For 8-connected motion with cardinal and diagonal transitions, octile distance provides the most faithful geometric abstraction. It is computationally inexpensive and more informative than Manhattan under diagonal traversal. The selected form is
 \begin{equation}
-h(n) = (\max(\Delta c,\Delta r)-\min(\Delta c,\Delta r)) + \sqrt{2}\,\min(\Delta c,\Delta r),
+    h(n) = (\max(\Delta c,\Delta r)-\min(\Delta c,\Delta r)) + \sqrt{2}\,\min(\Delta c,\Delta r),
 \end{equation}
-with $\Delta c = |c-c_g|$, $\Delta r = |r-r_g|$.
+with $\Delta c = |c-c_g|$ and $\Delta r = |r-r_g|$.
 
-\subsection{Heuristic Selection Process}
-Three practical heuristics were compared:
-\begin{itemize}[leftmargin=1.5em]
-    \item Manhattan ($|\Delta c|+|\Delta r|$): valid for 4-connectivity; less informative for diagonal moves.
-    \item Euclidean ($\sqrt{\Delta c^2+\Delta r^2}$): admissible and geometrically meaningful.
-    \item Octile: best aligned with 8-connected neighbor expansion and diagonal step cost.
-\end{itemize}
+The underlying reasoning is that a more informative admissible heuristic reduces unnecessary expansion without sacrificing solution quality. In practice, this shortened the expansion frontier in open spaces and made goal-directed behavior more deterministic in structured maps with long corridors.
 
-Final choice: \textbf{octile heuristic}, because it is computationally cheap, admissible for the motion model, and empirically gave faster convergence with fewer unnecessary expansions in corridor-rich maps.
+\subsection{Traversal Cost Model and Accessibility Threshold}
+The planner integrates geometric motion cost with map-based penalties to discourage trajectories through expensive cells. Accessibility is controlled by \texttt{max\_access\_cost}, which defines a hard threshold above which cells are rejected. This parameter was one of the strongest determinants of path clearance behavior. At very permissive values, the planner accepted trajectories that ran along high-cost inflation bands; at very strict values, narrow corridors became difficult or impossible to traverse even when physically feasible.
 
-\subsection{Costmap Interface and Safety Guards}
-Core coordinate helpers were implemented for robustness:
-\begin{itemize}[leftmargin=1.5em]
-    \item world-to-cell conversion ($XY\rightarrow CR$),
-    \item cell-to-world conversion ($CR\rightarrow XY$ at cell center),
-    \item row-major flattening ($CR\rightarrow\text{index}$),
-    \item map boundary check (\texttt{outOfMap\_()}).
-\end{itemize}
+A practical consequence of this threshold is that it cannot be tuned in isolation. Its effective meaning depends on inflation-layer shaping in the costmap. If inflation produces wide high-cost halos, an aggressive threshold can over-prune the map. If inflation is narrow or weak, a permissive threshold can allow unsafe edge-following. The final tuning therefore treated \texttt{max\_access\_cost} as part of a coupled safety system rather than a standalone planner variable.
 
-Additional validity checks were added before expansion:
-\begin{itemize}[leftmargin=1.5em]
-    \item reject if start/goal lies outside map,
-    \item reject if start/goal lies in inaccessible cells ($\text{cost}\geq \texttt{max\_access\_cost}$),
-    \item handle cancellation early and publish an empty path on failure/cancel for consistent downstream behavior.
-\end{itemize}
+\subsection{Corner-Cutting Prevention and Geometric Validity}
+A major path-validity issue in 8-connected grids is diagonal corner cutting. A diagonal transition can appear collision-free at endpoint cells while crossing forbidden geometry between them. To prevent this, diagonal neighbor acceptance was conditioned on the two adjacent orthogonal cells. If either side cell exceeded accessibility threshold, the diagonal transition was rejected. This prevented the planner from slipping through obstacle corners and materially improved robustness around tight L-shaped passages.
 
-\subsection{Corner-Cutting Prevention}
-A key failure mode in diagonal motion is passing between two blocked side cells. For a diagonal move $(\Delta c,\Delta r)$, the implementation rejects the move if either orthogonal side cell is inaccessible:
-\begin{equation}
-\text{if } \text{cost}(c+\Delta c,r)\geq T \;\text{or}\; \text{cost}(c,r+\Delta r)\geq T,\;\text{skip diagonal neighbor.}
-\end{equation}
-This removed ``wall clipping'' behavior near corners.
+The practical effect of this modification was a small increase in path length in certain corner-rich layouts, but the trade-off was strongly favorable because controller failures from geometrically invalid shortcuts were greatly reduced.
 
-\subsection{Path Reconstruction and Goal Handling}
-A previous bug source was path order and header consistency. The corrected sequence is:
-\begin{enumerate}[leftmargin=1.5em]
-    \item backtrack from goal node to start via parent pointers,
-    \item reverse the sequence to start$\rightarrow$goal,
-    \item keep frame and timestamps consistent,
-    \item enforce final pose as exact user goal pose (position + yaw).
-\end{enumerate}
+\subsection{Path Reconstruction, Frame Consistency, and Terminal Pose Integrity}
+Once goal expansion was reached, the planner reconstructed the route by parent backtracking from goal node to start and then reversing the sequence. During debugging, path direction and header consistency were treated as first-order concerns because controller behavior is highly sensitive to message integrity. The final implementation preserved consistent frame and timestamp handling and explicitly enforced the final pose as the user-defined goal pose so that requested terminal orientation is not lost during post-processing.
 
 \subsection{Path Densification}
-Densification was introduced to increase waypoint frequency and improve tracking smoothness. For each segment length $d$, number of interpolants is:
+The raw A* path can be sparse in long straight segments. Sparse waypoints increase heading jump between consecutive lookahead selections, which can destabilize local tracking. To mitigate this, segment-wise interpolation was introduced. For segment length $d$ and interpolation spacing $d_{\text{interp}}$, the interpolation count is
 \begin{equation}
-N = \max\left(1, \left\lceil \frac{d}{d_{\text{interp}}} \right\rceil \right),
+N = \max\left(1, \left\lceil \frac{d}{d_{\text{interp}}} \right\rceil \right).
 \end{equation}
-where $d_{\text{interp}}$ is \texttt{interpolation\_distance}.
+
+Densification was applied before smoothing and before final orientation assignment. This ordering was intentional: it provides the smoother with regularly spaced samples and gives the controller a higher-frequency geometric reference.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.95\linewidth]{\detokenize{Densification block within planner.png}}
-    \caption{Densification block used in planner post-processing.}
+    \caption{Densification logic used to increase waypoint frequency before downstream tracking.}
     \label{fig:densification_block}
 \end{figure}
 
-Observed effect: denser paths reduced heading jumps in the controller and reduced overshoot near bends.
-
-\subsection{Savitzky--Golay Smoothing}
-Savitzky--Golay smoothing was used to reduce jagged grid artifacts while preserving local path trends.
-
-Given half-window $m$ and polynomial order $p$, build Vandermonde matrix $\mathbf{J}\in\mathbb{R}^{(2m+1)\times(p+1)}$:
-\begin{equation}
-J_{r,c} = (r-m)^c,
-\end{equation}
-and compute kernel row from
+\subsection{Savitzky--Golay Smoothing: Implementation Details and Trade-offs}
+Savitzky--Golay smoothing was implemented to remove staircase artifacts from grid paths while preserving local trend structure. For half-window $m$ and polynomial order $p$, a Vandermonde matrix $\mathbf{J}\in\mathbb{R}^{(2m+1)\times(p+1)}$ is built and the fitting kernel is obtained from
 \begin{equation}
 \mathbf{A} = (\mathbf{J}^{\top}\mathbf{J})^{-1}\mathbf{J}^{\top}.
 \end{equation}
-Smoothed coordinates are generated by 1D convolution over $x_i$ and $y_i$ separately.
+The first row of this kernel is used to convolve path coordinates in each axis. Boundary treatment uses index clamping so that convolution remains defined at path ends.
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.82\linewidth]{\detokenize{Savitzky-Golay smoother implementation.png}}
-    \caption{Savitzky--Golay smoother implementation block.}
+    \includegraphics[width=0.85\linewidth]{\detokenize{Savitzky-Golay smoother implementation.png}}
+    \caption{Savitzky--Golay smoothing implementation in the planner pipeline.}
     \label{fig:sg_block}
 \end{figure}
 
-\subsection{Smoother Tuning Observations}
-Empirical observations from troubleshooting:
-\begin{itemize}[leftmargin=1.5em]
-    \item Increasing $m$ improves smoothness but can over-flatten turns.
-    \item High $p$ increases oscillatory fitting and may create unsafe deviations.
-    \item Endpoint drift can occur; forcing start and goal poses after smoothing improves terminal behavior.
-    \item In narrow corridors, aggressive smoothing may pull the path toward inflated zones.
-\end{itemize}
+The smoothing stage produced clear benefits in heading continuity, but it also introduced characteristic failure modes that required explicit safeguards. First, high-order polynomials can overfit local fluctuations and generate oscillatory deviations. Second, aggressive windows can flatten sharp transitions and reduce corridor clearance. Third, endpoint drift can interfere with terminal behavior if start and goal anchors are not enforced. The final methodology therefore constrained smoothing through parameter ranges and endpoint restoration rather than relying on unconstrained visual smoothness.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.95\linewidth]{\detokenize{m=30 p=20, (b) m=20, p=5.png}}
-    \caption{Comparison of path behavior under different $(m,p)$ settings.}
+    \caption{Representative comparison of path behavior under different smoothing settings.}
     \label{fig:mp_compare_main}
 \end{figure}
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.95\linewidth]{\detokenize{part 1 m=30 p=20, (b) m=20, p=5.png}}
-    \caption{Additional visual comparison of smoothing outcomes for selected $(m,p)$ values.}
+    \caption{Additional comparison showing corridor response sensitivity to $(m,p)$ choices.}
     \label{fig:mp_compare_part1}
 \end{figure}
 
-Working guideline used in tuning:
-\begin{itemize}[leftmargin=1.5em]
-    \item keep $p$ moderate (avoid overfitting),
-    \item use moderate-to-high $m$ only if map clearance remains safe,
-    \item verify with costmap overlay instead of only visual smoothness.
-\end{itemize}
+\section{Controller: Regulated Pure Pursuit Implementation}
+\subsection{Tracking Pipeline in \texttt{computeVelocityCommands()}}
+The controller follows a deterministic sequence at each control cycle. It first checks path availability and returns zero command if no valid path exists. It then evaluates goal proximity against positional threshold and switches to terminal-yaw behavior when near goal. If not in terminal state, it computes the closest point on the global path and performs lookahead search strictly forward from that closest index toward the goal. This directionality is essential: searching from the goal backward can produce invalid lookahead choices in maps where Euclidean proximity does not imply path connectivity.
 
-\section{Controller Design (Regulated Pure Pursuit)}
-\subsection{Core Pure Pursuit Geometry}
-The controller transforms the lookahead point into robot frame $(x',y')$, then computes curvature:
+The selected lookahead point is transformed into robot frame, yielding $(x',y')$. Curvature is then computed as
 \begin{equation}
-\kappa = \frac{2y'}{L^2}, \qquad L=\sqrt{x'^2+y'^2}.
+\kappa = \frac{2y'}{L^2}, \qquad L = \sqrt{x'^2+y'^2},
 \end{equation}
-Angular speed is obtained from
+and angular command follows from
 \begin{equation}
 \omega = v\kappa.
 \end{equation}
+This geometric formulation is lightweight and effective, but it is sensitive to lookahead design and path quality, which is why planner post-processing and controller regulation must be tuned jointly.
 
-A critical implementation detail is lookahead search direction: search begins from the \textbf{closest path point} and progresses \textbf{toward the goal}. This avoids selecting irrelevant points behind walls or in disconnected regions.
+\subsection{Regulation Heuristics}
+The regulated pure pursuit extension modifies velocity to improve stability and safety. Lookahead is adapted with speed via
+\begin{equation}
+L_h = g_l\,v,
+\end{equation}
+where $g_l$ is lookahead gain. Curvature-based regulation reduces linear speed as curvature demand increases, reducing overshoot in turns. Proximity-based regulation reduces speed when the laser-derived obstacle distance $d_o$ falls below proximity threshold $d_{prox}$, mitigating aggressive motion in confined spaces. Commands are finally clamped to hardware-safe linear and angular limits.
 
-\subsection{Regulated Pure Pursuit Heuristics}
-Following project requirements, three regulation mechanisms were used:
-\begin{enumerate}[leftmargin=1.5em]
-    \item \textbf{Variable lookahead:}
-    \begin{equation}
-        L_h = g_l\,v,
-    \end{equation}
-    where $g_l$ is lookahead gain.
-    \item \textbf{Curvature regulation:} reduce linear speed for large $|\kappa|$ to avoid overshoot.
-    \item \textbf{Proximity regulation:} reduce linear speed when laser-derived obstacle distance $d_o$ is below threshold $d_{prox}$.
-\end{enumerate}
+The essential implementation insight is that these heuristics should not be interpreted as independent toggles. They are coupled by geometry. Increasing lookahead can reduce instantaneous curvature demand, which can in turn weaken curvature slowdown; if proximity slowdown is also weak, the robot can enter corners too quickly. Conversely, overly conservative proximity and curvature regulation can make the robot sluggish and may destabilize final heading correction timing.
 
-These heuristics improved stability in tight corners and reduced corridor oscillation.
+\subsection{Final Orientation Behavior}
+A dedicated terminal mode was implemented to satisfy project requirements on final heading alignment. When position error is below \texttt{xy\_goal\_thresh\_} but yaw error remains above \texttt{yaw\_goal\_thresh\_} (specified as \SI{0.25}{rad}), the controller commands pure rotation until orientation error falls inside threshold. This avoids premature stopping at incorrect heading and prevents the controller from attempting unnecessary translational correction near the final pose.
 
-\subsection{Goal Position and Final Yaw Alignment}
-Near the final waypoint:
-\begin{itemize}[leftmargin=1.5em]
-    \item if position error is small but yaw error is above threshold, command pure rotation,
-    \item stop only when both position and yaw errors are within thresholds.
-\end{itemize}
-This prevents premature stopping with incorrect heading and aligns with the project rubric.
+\section{Parameter Discussion, Counter-cases, and Tuning Logic}
+This section documents not only final parameter choices but also the counter-cases that motivated those choices. The aim is to preserve technical traceability from observed behavior to parameter action.
 
-\subsection{Controller Failure Modes and Fixes}
-\begin{table}[H]
-\centering
-\caption{Controller issues and corrective actions}
-\begin{tabular}{p{0.24\linewidth} p{0.33\linewidth} p{0.33\linewidth}}
-\toprule
-Issue & Cause & Fix \\
-\midrule
-Near-goal oscillation & Gains too aggressive, high $v$ near high curvature & Lower base speed, strengthen curvature heuristic, clamp $\omega$ \\
-Missed turns in corridors & Lookahead too large; nearby points skipped & Reduce lookahead gain, enforce closest-point forward search \\
-Jerky corrections & Sparse waypoints and abrupt heading changes & Densify path, moderate smoothing, rate limits \\
-Inflation hugging & Access threshold too permissive & Reduce \texttt{max\_access\_cost}, tune inflation parameters \\
-\bottomrule
-\end{tabular}
-\end{table}
+For the planner, \texttt{max\_access\_cost} was the strongest determinant of inflation-zone interaction. A permissive threshold allowed routes that tracked high-cost boundaries and appeared to ``hug'' inflated walls. Lowering the threshold shifted trajectories toward lower-cost corridor centers at the expense of reduced tolerance in tight passages. This trade-off was controlled by matching threshold with inflation settings rather than chasing a single universal value.
 
-\section{Parameter Tuning Summary}
-\subsection{Planner Parameters}
-\begin{table}[H]
-\centering
-\caption{Planner parameter guidance from observed runs}
-\begin{tabular}{p{0.25\linewidth} p{0.18\linewidth} p{0.45\linewidth}}
-\toprule
-Parameter & Typical range & Observed effect \\
-\midrule
-\texttt{max\_access\_cost} & 140--180 & Lower values increase clearance but may reject narrow passage routes \\
-\texttt{interpolation\_distance} & 0.02--0.05 m & Smaller values increase tracking smoothness and computational load \\
-\texttt{sg\_half\_window} ($m$) & 4--20 (map-dependent) & Larger values smooth more but risk flattening narrow turns \\
-\texttt{sg\_order} ($p$) & 3--9 (recommended practical) & High values overfit and may produce oscillatory unsafe paths \\
-\bottomrule
-\end{tabular}
-\end{table}
+The interpolation parameter \texttt{interpolation\_distance} governs waypoint density. Large spacing produced sparse references and stronger heading jumps, which increased tracking corrections in curved sections. Very small spacing improved smoothness but increased computational load and made post-smoothing behavior more local. A moderate spacing gave stable tracking without unnecessary overhead.
 
-\subsection{Controller Parameters}
-\begin{table}[H]
-\centering
-\caption{Controller parameter guidance}
-\begin{tabular}{p{0.25\linewidth} p{0.18\linewidth} p{0.45\linewidth}}
-\toprule
-Parameter & Typical range & Observed effect \\
-\midrule
-Lookahead gain $g_l$ & 0.8--1.8 & Too large misses local curvature; too small can jitter \\
-Curvature threshold $c_h$ & map/robot dependent & Lower threshold slows robot earlier on bends \\
-Proximity threshold $d_{prox}$ & 0.20--0.40 m & Larger threshold yields more conservative obstacle slowdown \\
-\texttt{yaw\_goal\_thresh\_} & 0.25 rad (spec) & Ensures final heading alignment before full stop \\
-\bottomrule
-\end{tabular}
-\end{table}
+Savitzky--Golay parameters required the most careful coupling analysis. Increasing half-window $m$ generally improved smoothness, but excessive windows flattened local path detail and increased clearance risk in narrow passages. Increasing order $p$ improved local fit up to a point, then introduced oscillatory behavior and possible geometric drift. The practical counter-case observed was that visually smooth paths could still be operationally unsafe if they approached inflated obstacles too closely. For this reason, smoothing quality was judged against costmap feasibility and controller response, not shape aesthetics.
 
-\section{Experimental Notes and Practical Lessons}
-\subsection{First-Try Failure, Second-Try Success}
-Intermittent ``first run fails, second run works'' behavior was observed. Likely causes are startup synchronization (TF/costmap readiness) and initial planner/controller state mismatch. Practical mitigation was to wait briefly after bringup before sending the first goal and to verify costmap is fully populated.
+On the controller side, lookahead gain $g_l$ defined the dominant stability trade-off. High gain produced smoother commands in open space but skipped local path detail in bends, creating corner understeer and delayed turning. Low gain improved local responsiveness but amplified jitter and over-correction. Curvature threshold $c_h$ and proximity threshold $d_{prox}$ were then tuned around this baseline. If $c_h$ was too permissive, turn entry remained too fast and overshoot increased; if too strict, traversal became unnecessarily slow. If $d_{prox}$ was too small, obstacle slowdown activated too late; if too large, robot speed collapsed even when clearance was acceptable.
 
-\subsection{Inflation-Zone Hugging}
-Path hugging of inflation bands was observed when accessibility threshold was too permissive. Lowering \texttt{max\_access\_cost} reduced hugging and produced safer center-lane trajectories in corridors.
+The goal thresholds required similar balancing. A small \texttt{xy\_goal\_thresh\_} improves positional precision but can induce micro-corrections near the goal when noise is present. The fixed \texttt{yaw\_goal\_thresh\_} value of \SI{0.25}{rad} was operationally appropriate for reliable final orientation without prolonged rotational hunting.
 
-\subsection{Smoothing Tradeoff}
-Smoothing improved controller comfort but can violate safety if over-aggressive. Therefore, smoothing quality was judged by both shape and costmap feasibility, not by visual aesthetics alone.
+\section{Integrated Results and Practical Observations}
+After planner hardening and controller regulation were combined, path execution became substantially more repeatable in corridor transitions and corner entries. Densification and smoothing reduced high-frequency heading variation, while corner-cut prevention removed the most severe geometric invalidities. Controller regulation then converted this cleaner geometric reference into smoother velocity behavior with fewer oscillatory corrections.
 
-\subsection{Planning Scope Snapshot}
-The planning and controller checklist used during implementation is shown below for traceability with the development notes.
-\begin{figure}[H]
-    \centering
-    \includegraphics[width=0.55\linewidth]{\detokenize{Screenshot 2026-02-27 at 7.56.19 PM.png}}
-    \caption{Implementation scope notes used during report structuring.}
-    \label{fig:scope_notes}
-\end{figure}
+An intermittent first-run failure followed by second-run success was still occasionally observed during debugging. The most plausible explanation was startup synchronization, especially transient availability of consistent costmap and TF states immediately after bringup. This behavior was mitigated operationally by delaying first goal dispatch and verifying map readiness before execution.
+
+Overall, the final behavior met the intended project direction: reliable path generation, collision-aware traversal through constrained areas, controlled speed adaptation near curvature and obstacles, and consistent final heading alignment.
+
+\section{Further Actions}
+The next improvement stage should focus on systematic quantitative reporting. The current analysis is causally rigorous but primarily qualitative. A stronger final submission would include repeat-count statistics over fixed scenarios, average completion times, near-goal oscillation counts, and minimum obstacle clearance estimates. These measurements would allow parameter sensitivity to be documented numerically rather than descriptively.
+
+A second action is robustness validation across more map topologies. The current tuning is effective in corridor-dominant layouts; broader validation should include cluttered open spaces, asymmetric bottlenecks, and longer multi-turn trajectories. If computation budget allows, adaptive parameter scheduling could be explored, especially for lookahead and smoothing aggressiveness as a function of local map complexity.
 
 \section{Conclusion}
-The final solution integrates A* planning, robust path post-processing, and regulated pure pursuit tracking. The most impactful improvements were (i) corner-cutting prevention, (ii) path densification, (iii) careful smoothing constraints, and (iv) controller regulation based on curvature and obstacle proximity.
+This project demonstrates that reliable navigation emerges from coordinated planner-controller design rather than isolated algorithm selection. The planner required not only A* search, but also correctness safeguards, geometric validity checks, and post-processing tuned for downstream tracking. The controller required not only pure pursuit geometry, but regulated heuristics and terminal-state logic that respect physical and environmental constraints.
 
-The project reinforces that robust navigation comes from aligning theory, implementation details, and empirical tuning: equations alone are insufficient without failure-mode-driven validation.
+The most important outcome is methodological: each behavior was improved by identifying the responsible mechanism before tuning parameters. This cause-driven workflow produced a system that is both operationally stronger and technically explainable, which is the core requirement for a high-quality engineering report in autonomous robotics.
 
-\section*{Member Contribution (Template)}
-\textbf{Member A (Matric):} Planner core, smoothing implementation, planner tuning.\\
-\textbf{Member B (Matric):} Controller implementation, RPP tuning, goal-yaw behavior.\\
-\textbf{Member C (Matric):} Experiment design, logging, video/report integration.
+\section*{Member Contribution (To Be Finalized)}
+Member contributions will be finalized by mapping each implementation block, tuning stage, and experiment activity to matric-number-identified team members as required by the project brief.
 
 \section*{References}
-\begin{enumerate}[leftmargin=1.5em]
-    \item EE4308 Project 1 spec, AY25/26 Sem 2.
-    \item EE4308 Week 2 slides: Motion and Mapping.
-    \item EE4308 Week 3 slides: Planners.
-    \item EE4308 Week 4 slides: Trajectories and Motion Control.
-    \item S. Dolgov et al., ``Practical Search Techniques in Path Planning for Autonomous Driving,'' 2008.
-\end{enumerate}
+EE4308 Project 1 specification, AY25/26 Sem 2, National University of Singapore.\\
+EE4308 Week 2 lecture notes, Motion and Mapping.\\
+EE4308 Week 3 lecture notes, Planners.\\
+EE4308 Week 4 lecture notes, Trajectories and Motion Control.\\
+S. Dolgov et al., ``Practical Search Techniques in Path Planning for Autonomous Driving,'' 2008.
 
 \end{document}
