@@ -1,0 +1,46 @@
+name: Sync Overleaf
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'overleaf/**'
+      - '.github/workflows/overleaf-sync.yml'
+  workflow_dispatch:
+
+jobs:
+  sync-to-overleaf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub repo
+        uses: actions/checkout@v4
+
+      - name: Clone Overleaf project
+        env:
+          OVERLEAF_GIT_TOKEN: ${{ secrets.OVERLEAF_GIT_TOKEN }}
+          OVERLEAF_PROJECT_ID: ${{ secrets.OVERLEAF_PROJECT_ID }}
+        run: |
+          git clone "https://git:${OVERLEAF_GIT_TOKEN}@git.overleaf.com/${OVERLEAF_PROJECT_ID}" overleaf-remote
+
+      - name: Mirror files from repo/overleaf to Overleaf project
+        run: |
+          rsync -av --delete --exclude '.git' overleaf/ overleaf-remote/
+
+      - name: Commit and push to Overleaf master
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          cd overleaf-remote
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to sync."
+            exit 0
+          fi
+
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          git commit -m "Sync from GitHub ${SHORT_SHA}"
+          git push origin HEAD:master
