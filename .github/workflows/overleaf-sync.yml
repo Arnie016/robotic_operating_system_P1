@@ -19,7 +19,7 @@ jobs:
       - name: Clone Overleaf project
         env:
           OVERLEAF_GIT_TOKEN: ${{ secrets.OVERLEAF_GIT_TOKEN }}
-          OVERLEAF_PROJECT_ID: ${{ secrets.OVERLEAF_PROJECT_ID }}
+          OVERLEAF_PROJECT_ID: "6998135d3a689ef9ef3dd6c7"
         run: |
           git clone "https://git:${OVERLEAF_GIT_TOKEN}@git.overleaf.com/${OVERLEAF_PROJECT_ID}" overleaf-remote
 

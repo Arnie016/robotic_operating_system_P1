@@ -14,7 +14,6 @@ This workflow pushes files from `overleaf/` in your GitHub repo into your existi
    - top-right avatar -> **Account Settings** -> **Git** (or **Git integration/authentication tokens**) -> create/copy token.
 
 Required values:
-- `OVERLEAF_PROJECT_ID = 6998135d3a689ef9ef3dd6c7`
 - `OVERLEAF_GIT_TOKEN = <token from Overleaf>`
 
 ## 2) GitHub screens (exact click path)
@@ -22,9 +21,6 @@ Required values:
 1. Open your GitHub repo.
 2. Go to **Settings** -> **Secrets and variables** -> **Actions**.
 3. Click **New repository secret** and add:
-   - Name: `OVERLEAF_PROJECT_ID`
-   - Secret: `6998135d3a689ef9ef3dd6c7`
-4. Click **New repository secret** again and add:
    - Name: `OVERLEAF_GIT_TOKEN`
    - Secret: your Overleaf git token.
 
